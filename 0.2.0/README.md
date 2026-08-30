@@ -53,7 +53,6 @@ VideoManager/
 └── docs/
     ├── api-contract.md # REST API 契约
     ├── data-model.md   # SQLite 数据模型
-    └── milestones.md   # 阶段规划与进度
 ```
 
 ## 🚀 快速开始
@@ -96,7 +95,6 @@ flutter run       # 连接 Android 设备/模拟器
 
 - [REST API 契约](docs/api-contract.md)
 - [SQLite 数据模型](docs/data-model.md)
-- [阶段规划与进度](docs/milestones.md)
 
 ## 🔗 项目链接
 
