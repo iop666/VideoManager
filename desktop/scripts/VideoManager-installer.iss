@@ -1,12 +1,22 @@
-﻿; VideoManager 安装版脚本（Inno Setup）
-; 编译: ISCC.exe VideoManager-installer.iss
-; 源码: desktop/dist/win-unpacked （electron-builder --win dir 产物）
+; VideoManager installer script (Inno Setup)
+; Usage:
+;   ISCC.exe "/DVmRoot=<repo root>" "/DIssueOut=<output dir>" "/DInnoLang=<Inno Setup Languages dir>" VideoManager-installer.iss
+; Source tree: <VmRoot>\desktop\dist\win-unpacked  (electron-builder --win dir output)
+
+#ifndef VmRoot
+#define VmRoot "..\.."
+#endif
+#ifndef IssueOut
+#define IssueOut "output"
+#endif
+#ifndef InnoLang
+#define InnoLang ""
+#endif
 
 #define MyAppName "VideoManager"
-#define MyAppVersion "0.5.0"
+#define MyAppVersion "0.5.1"
 #define MyAppPublisher "VideoManager"
 #define MyAppExeName "VideoManager.exe"
-;#define WinUnpacked "D:\DeepseekHarness\VideoManager\desktop\dist\win-unpacked"
 
 [Setup]
 AppId={{8F2E3C4A-5B6D-4E7F-9A1B-2C3D4E5F6A7B}
@@ -16,26 +26,26 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputDir=D:\DeepseekHarness\VideoManager_issue\0.5.0\Windows安装软件
+OutputDir={#IssueOut}
 OutputBaseFilename=VideoManager-{#MyAppVersion}-setup
-SetupIconFile=D:\DeepseekHarness\VideoManager\desktop\resources\icon.ico
+SetupIconFile={#VmRoot}\desktop\resources\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesInstallIn64BitMode=x64compatible
-; 安装到 Program Files 不可写，数据目录自动回退 APPDATA（应用内已处理）
+; Data dir under Program Files is not writable - app falls back to APPDATA automatically
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "D:\Windows\AI-Agent\Tools\InnoSetup\Languages\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "{#InnoLang}\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 打包 win-unpacked 全部内容
-Source: "D:\DeepseekHarness\VideoManager\desktop\dist\win-unpacked\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Package all content of win-unpacked
+Source: "{#VmRoot}\desktop\dist\win-unpacked\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -45,5 +55,5 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [UninstallDelete]
-; 清理用户数据（绿色数据目录在 exe 旁或 APPDATA）
+; Clean user data (portable data dir next to exe, or APPDATA)
 Type: filesandordirs; Name: "{app}\data"

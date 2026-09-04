@@ -74,7 +74,7 @@ function resolveAppVersion(): string {
   const v = app.getVersion()
   // 排除 Electron 自身版本（44.x 等非项目版本）
   if (v && !/^44\./.test(v)) return v
-  return '0.5.0'
+  return '0.5.1'
 }
 
 /** 北京时间文件名时间戳（YYYY-MM-DDTHH-mm-ss，东八区） */
