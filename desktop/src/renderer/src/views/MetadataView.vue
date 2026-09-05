@@ -1,9 +1,10 @@
 <script setup lang="ts">
 defineOptions({ name: 'MetadataView' })
-import { computed, onActivated, onMounted, ref, watch } from 'vue'
+import { computed, onActivated, onDeactivated, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import {
   NButton,
+  NCheckbox,
   NEmpty,
   NIcon,
   NInput,
@@ -22,7 +23,7 @@ import { formatBytes, formatDuration } from '../utils/format'
 import ThumbImg from '../components/ThumbImg.vue'
 import MetaEditDrawer from '../components/MetaEditDrawer.vue'
 import KeyframeDrawer from '../components/KeyframeDrawer.vue'
-import type { Orientation, SortDir, SortField, VideoListItem } from '../../../shared/types'
+import type { BatchVideoPatch, Orientation, SortDir, SortField, VideoListItem } from '../../../shared/types'
 
 const app = useAppStore()
 const meta = useMetaStore()
@@ -76,7 +77,8 @@ const dirOptions: { label: string; value: SortDir }[] = [
 
 const orientationOptions: { label: string; value: Orientation }[] = [
   { label: '横屏', value: 'landscape' },
-  { label: '竖屏', value: 'portrait' }
+  { label: '竖屏', value: 'portrait' },
+  { label: '方形', value: 'square' }
 ]
 
 const categoryOptions = computed(() => meta.categoryOptions())
@@ -102,6 +104,279 @@ const deleting = ref(false)
 const clearAllOpen = ref(false)
 const clearing = ref(false)
 const clearResult = ref<number | null>(null)
+/** 整个数据库的记录总数（清空范围是全库，与当前筛选无关） */
+const dbTotal = ref(0)
+
+async function openClearAll(): Promise<void> {
+  clearAllOpen.value = true
+  try {
+    const res = await window.api.listVideos({ page: 1, pageSize: 1, includeMissing: true })
+    dbTotal.value = res.total
+  } catch {
+    dbTotal.value = 0
+  }
+}
+
+// ============ 多选批量模式（左键长按进入 / 工具栏「多选」） ============
+const batchMode = ref(false)
+const selectedIds = ref<Set<number>>(new Set())
+const batchDeleteOpen = ref(false)
+const batchEditOpen = ref(false)
+const batchBusy = ref(false)
+
+const selectedCount = computed(() => selectedIds.value.size)
+
+function isSelected(v: VideoListItem): boolean {
+  return selectedIds.value.has(v.id)
+}
+
+function toggleSelect(v: VideoListItem): void {
+  const next = new Set(selectedIds.value)
+  if (next.has(v.id)) next.delete(v.id)
+  else next.add(v.id)
+  selectedIds.value = next
+}
+
+function selectAllPage(): void {
+  const next = new Set(selectedIds.value)
+  for (const item of items.value) next.add(item.id)
+  selectedIds.value = next
+}
+
+function clearSelection(): void {
+  selectedIds.value = new Set()
+}
+
+function startBatch(): void {
+  batchMode.value = true
+}
+
+function enterBatch(v: VideoListItem): void {
+  batchMode.value = true
+  selectedIds.value = new Set([v.id])
+}
+
+function exitBatch(): void {
+  batchMode.value = false
+  selectedIds.value = new Set()
+  batchDeleteOpen.value = false
+  batchEditOpen.value = false
+  batchRemark.value = ''
+  batchRemarkClear.value = false
+}
+
+// 离开本页（keep-alive 切走）自动退出多选模式
+onDeactivated(() => {
+  if (batchMode.value) exitBatch()
+})
+
+/** 封面/标题点击：非批量 = 打开编辑；批量 = 切换选中；长按刚触发时抑制本次 click */
+function onSelectAreaClick(v: VideoListItem): void {
+  if (suppressNextClick) {
+    suppressNextClick = false
+    return
+  }
+  if (batchMode.value) toggleSelect(v)
+  else editId.value = v.id
+}
+
+/** 卡片其余区域点击（批量模式才生效，避免误触） */
+function onCardRootClick(v: VideoListItem, e: MouseEvent): void {
+  if (suppressNextClick) {
+    suppressNextClick = false
+    return
+  }
+  if ((e.target as HTMLElement).closest('.sel-item')) return
+  if (batchMode.value) toggleSelect(v)
+}
+
+function onCardContextmenu(v: VideoListItem): void {
+  if (batchMode.value) toggleSelect(v)
+  else openKeyframes(v)
+}
+
+// ---- 长按识别：按住 550ms 且位移 < 8px 进入多选并选中该视频 ----
+let suppressNextClick = false
+let longPressTimer: number | undefined
+let pressVideo: VideoListItem | null = null
+let pressX = 0
+let pressY = 0
+
+function clearLongPress(): void {
+  if (longPressTimer !== undefined) {
+    window.clearTimeout(longPressTimer)
+    longPressTimer = undefined
+  }
+  pressVideo = null
+}
+
+function onCardPointerDown(v: VideoListItem, e: PointerEvent): void {
+  if (batchMode.value || e.button !== 0) return
+  const t = e.target as HTMLElement | null
+  if (t && t.closest('.no-batch')) return // 按钮等交互区不触发长按
+  pressVideo = v
+  pressX = e.clientX
+  pressY = e.clientY
+  suppressNextClick = false
+  longPressTimer = window.setTimeout(() => {
+    longPressTimer = undefined
+    const target = pressVideo
+    pressVideo = null
+    if (target) {
+      suppressNextClick = true
+      enterBatch(target)
+    }
+  }, 550)
+}
+
+function onCardPointerMove(e: PointerEvent): void {
+  if (longPressTimer === undefined) return
+  const dx = e.clientX - pressX
+  const dy = e.clientY - pressY
+  if (dx * dx + dy * dy > 64) clearLongPress() // 位移 > 8px 视为滚动/拖动
+}
+
+function onCardPointerUp(): void {
+  clearLongPress()
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && batchMode.value) exitBatch()
+})
+
+// ---- 批量动作 ----
+async function doBatchFavorite(favorite: boolean): Promise<void> {
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
+  batchBusy.value = true
+  try {
+    const res = await window.api.batchUpdateVideos(ids, { isFavorite: favorite })
+    if (!res.ok) {
+      message.error(res.error ?? '操作失败')
+      return
+    }
+    message.success(`已${favorite ? '收藏' : '取消收藏'} ${ids.length} 条`)
+    await Promise.all([load(), meta.load()])
+    exitBatch()
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+function openBatchDelete(): void {
+  if (selectedCount.value === 0) return
+  batchDeleteOpen.value = true
+}
+
+async function doBatchRemove(deleteFile: boolean): Promise<void> {
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
+  batchBusy.value = true
+  try {
+    const res = await window.api.batchRemoveVideos(ids, deleteFile)
+    if (!res.ok) {
+      message.error(res.error ?? '删除失败')
+      return
+    }
+    message.success(
+      deleteFile
+        ? `已移除 ${res.removed} 条记录（删除本地文件 ${res.deletedFiles} 个）`
+        : `已移除 ${res.removed} 条记录（文件保留）`
+    )
+    batchDeleteOpen.value = false
+    await Promise.all([load(), meta.load()])
+    exitBatch()
+  } finally {
+    batchBusy.value = false
+  }
+}
+
+// ---- 批量编辑弹窗状态（分类/作者/追加标签/备注） ----
+/** 哨兵值：保持原样 / 清除 */
+const BATCH_KEEP = -1
+const BATCH_CLEAR = -2
+const batchCat = ref<number>(BATCH_KEEP)
+const batchAuthor = ref<number>(BATCH_KEEP)
+const batchTags = ref<number[]>([])
+const batchRemark = ref('')
+const batchRemarkClear = ref(false)
+
+const batchCatOptions = computed(() => [
+  { label: '（保持原样）', value: BATCH_KEEP },
+  { label: '（清除分类）', value: BATCH_CLEAR },
+  ...meta.categoryOptions()
+])
+const batchAuthorOptions = computed(() => [
+  { label: '（保持原样）', value: BATCH_KEEP },
+  { label: '（清除作者）', value: BATCH_CLEAR },
+  ...meta.authorOptions()
+])
+const batchTagOptions = computed(() => meta.tagOptions())
+
+function openBatchEdit(): void {
+  if (selectedCount.value === 0) return
+  batchCat.value = BATCH_KEEP
+  batchAuthor.value = BATCH_KEEP
+  batchTags.value = []
+  batchRemark.value = ''
+  batchRemarkClear.value = false
+  batchEditOpen.value = true
+}
+
+async function applyBatchEdit(): Promise<void> {
+  const ids = [...selectedIds.value]
+  if (ids.length === 0) return
+  const patch: BatchVideoPatch = {}
+  if (batchCat.value !== BATCH_KEEP) {
+    patch.categoryId = batchCat.value === BATCH_CLEAR ? null : batchCat.value
+  }
+  if (batchAuthor.value !== BATCH_KEEP) {
+    if (batchAuthor.value === BATCH_CLEAR) {
+      patch.authorId = null
+      patch.author = null
+    } else {
+      patch.authorId = batchAuthor.value
+      patch.author = meta.authors.find((a) => a.id === batchAuthor.value)?.name ?? null
+    }
+  }
+  if (batchRemarkClear.value) patch.remark = null
+  else if (batchRemark.value.trim()) patch.remark = batchRemark.value.trim()
+
+  const tagNames = batchTags.value
+    .map((id) => meta.tags.find((t) => t.id === id)?.name)
+    .filter((n): n is string => !!n)
+
+  batchBusy.value = true
+  try {
+    let changed = 0
+    if (Object.keys(patch).length > 0) {
+      const res = await window.api.batchUpdateVideos(ids, patch)
+      if (!res.ok) {
+        message.error(res.error ?? '批量修改失败')
+        return
+      }
+      changed = res.updated
+    }
+    if (tagNames.length > 0) {
+      const res2 = await window.api.batchAppendVideoTags(ids, tagNames)
+      if (!res2.ok) {
+        message.error(res2.error ?? '批量添加标签失败')
+        return
+      }
+      changed = Math.max(changed, res2.updated)
+    }
+    if (changed === 0) {
+      message.warning('未做任何修改')
+      return
+    }
+    message.success(`已更新 ${changed} 条元数据`)
+    batchEditOpen.value = false
+    await Promise.all([load(), meta.load()])
+    exitBatch()
+  } finally {
+    batchBusy.value = false
+  }
+}
 
 onMounted(async () => {
   void meta.load()
@@ -288,10 +563,20 @@ async function doClearAll(): Promise<void> {
         </template>
       </n-input>
       <div class="spacer" />
-      <n-button size="small" type="error" secondary @click="clearAllOpen = true">
+      <n-button size="small" type="error" secondary @click="openClearAll">
         <template #icon><n-icon><TrashOutline /></n-icon></template>
         清空全部数据
       </n-button>
+      <n-button
+        v-if="!batchMode"
+        size="small"
+        secondary
+        title="点击进入多选（或长按某张封面 0.55 秒）"
+        @click="startBatch"
+      >
+        多选
+      </n-button>
+      <n-button v-else size="small" type="warning" secondary @click="exitBatch">退出多选</n-button>
       <div class="view-toggle">
         <button
           class="view-btn"
@@ -322,15 +607,27 @@ async function doClearAll(): Promise<void> {
             v-for="v in items"
             :key="v.id"
             class="card"
-            :title="'左键：编辑元数据 · 右键：关键帧截图概览'"
-            @contextmenu.prevent="openKeyframes(v)"
+            :class="{ selected: isSelected(v) }"
+            :title="
+              batchMode
+                ? '单击 / 右键切换选中 · Esc 退出多选'
+                : '左键封面或标题：编辑元数据 · 右键：关键帧概览 · 长按封面：进入多选'
+            "
+            @pointerdown="(e: PointerEvent) => onCardPointerDown(v, e)"
+            @pointermove="onCardPointerMove"
+            @pointerup="onCardPointerUp"
+            @pointercancel="onCardPointerUp"
+            @pointerleave="onCardPointerUp"
+            @click="onCardRootClick(v, $event)"
+            @contextmenu.prevent="onCardContextmenu(v)"
           >
-            <div class="thumb-wrap" @click="editId = v.id">
+            <div class="thumb-wrap sel-item" @click="onSelectAreaClick(v)">
               <ThumbImg :video-id="v.id" :thumbnail-path="v.thumbnailPath" />
               <span class="dur">{{ formatDuration(v.duration) }}</span>
               <span v-if="v.status === 'missing'" class="missing-tag">缺失</span>
               <button
-                class="fav-btn"
+                v-if="!batchMode"
+                class="fav-btn no-batch"
                 :class="{ active: v.isFavorite === 1 }"
                 :title="v.isFavorite === 1 ? '取消收藏' : '收藏'"
                 @click.stop="toggleFavorite(v)"
@@ -338,12 +635,12 @@ async function doClearAll(): Promise<void> {
                 <n-icon :size="15"><Heart v-if="v.isFavorite === 1" /><HeartOutline v-else /></n-icon>
               </button>
             </div>
-            <div class="card-title" :title="v.title" @click="editId = v.id">{{ v.title }}</div>
+            <div class="card-title sel-item" :title="v.title" @click="onSelectAreaClick(v)">{{ v.title }}</div>
             <div class="card-meta">
               <span>{{ formatBytes(v.fileSize) }}</span>
               <span v-if="v.sha256">· {{ v.sha256.slice(0, 10) }}…</span>
             </div>
-            <div class="card-actions">
+            <div v-if="!batchMode" class="card-actions no-batch">
               <n-button size="tiny" @click="editId = v.id">
                 <template #icon><n-icon><CreateOutline /></n-icon></template>
                 编辑
@@ -359,14 +656,25 @@ async function doClearAll(): Promise<void> {
             v-for="v in items"
             :key="v.id"
             class="list-item"
-            :title="'左键：编辑元数据 · 右键：关键帧截图概览'"
-            @contextmenu.prevent="openKeyframes(v)"
+            :class="{ selected: isSelected(v) }"
+            :title="
+              batchMode
+                ? '单击 / 右键切换选中 · Esc 退出多选'
+                : '左键封面或标题：编辑元数据 · 右键：关键帧概览 · 长按封面：进入多选'
+            "
+            @pointerdown="(e: PointerEvent) => onCardPointerDown(v, e)"
+            @pointermove="onCardPointerMove"
+            @pointerup="onCardPointerUp"
+            @pointercancel="onCardPointerUp"
+            @pointerleave="onCardPointerUp"
+            @click="onCardRootClick(v, $event)"
+            @contextmenu.prevent="onCardContextmenu(v)"
           >
-            <div class="list-thumb" @click="editId = v.id">
+            <div class="list-thumb sel-item" @click="onSelectAreaClick(v)">
               <ThumbImg :video-id="v.id" :thumbnail-path="v.thumbnailPath" />
               <span v-if="v.status === 'missing'" class="missing-tag">缺失</span>
             </div>
-            <div class="list-body" @click="editId = v.id">
+            <div class="list-body sel-item" @click="onSelectAreaClick(v)">
               <div class="list-title">{{ v.title }}</div>
               <div class="list-meta">
                 <span>{{ formatBytes(v.fileSize) }}</span>
@@ -374,14 +682,15 @@ async function doClearAll(): Promise<void> {
               </div>
             </div>
             <button
-              class="list-fav-btn"
+              v-if="!batchMode"
+              class="list-fav-btn no-batch"
               :class="{ active: v.isFavorite === 1 }"
               :title="v.isFavorite === 1 ? '取消收藏' : '收藏'"
               @click.stop="toggleFavorite(v)"
             >
               <n-icon :size="17"><Heart v-if="v.isFavorite === 1" /><HeartOutline v-else /></n-icon>
             </button>
-            <div class="list-actions">
+            <div v-if="!batchMode" class="list-actions no-batch">
               <n-button size="tiny" @click="editId = v.id">编辑</n-button>
               <n-button size="tiny" type="error" quaternary @click="deleteTarget = v">删除</n-button>
             </div>
@@ -402,6 +711,25 @@ async function doClearAll(): Promise<void> {
       />
     </div>
 
+    <!-- 多选批量操作栏（粘底部） -->
+    <div v-if="batchMode" class="batch-bar">
+      <div class="batch-info">
+        <span class="batch-count">已选 {{ selectedCount }} 条</span>
+        <span class="muted-inline">单击 / 右键卡片切换选中 · Esc 退出</span>
+      </div>
+      <div class="batch-actions">
+        <n-button size="small" quaternary @click="selectAllPage">全选本页</n-button>
+        <n-button size="small" quaternary @click="clearSelection">清空选择</n-button>
+        <span class="batch-sep" />
+        <n-button size="small" :disabled="selectedCount === 0 || batchBusy" :loading="batchBusy" @click="doBatchFavorite(true)">收藏</n-button>
+        <n-button size="small" :disabled="selectedCount === 0 || batchBusy" @click="doBatchFavorite(false)">取消收藏</n-button>
+        <n-button size="small" :disabled="selectedCount === 0 || batchBusy" @click="openBatchEdit">分类 / 作者 / 标签 / 备注…</n-button>
+        <n-button size="small" type="error" secondary :disabled="selectedCount === 0 || batchBusy" @click="openBatchDelete">删除…</n-button>
+        <span class="batch-sep" />
+        <n-button size="small" type="warning" secondary @click="exitBatch">退出</n-button>
+      </div>
+    </div>
+
     <!-- 编辑抽屉：保存后自动关闭并刷新列表 -->
     <MetaEditDrawer
       :video-id="editId"
@@ -415,6 +743,74 @@ async function doClearAll(): Promise<void> {
       @close="closeKeyframes"
     />
 
+    <!-- 批量删除确认 -->
+    <n-modal
+      :show="batchDeleteOpen"
+      preset="card"
+      style="width: 440px"
+      title="批量删除所选记录？"
+      @update:show="(v: boolean) => !v && (batchDeleteOpen = false)"
+    >
+      <p class="del-text">
+        将移除选中的 <strong>{{ selectedCount }}</strong> 条视频记录、封面与关键帧元数据；缺失 / 占位记录自动降级为仅移除。
+        <strong>「仅移除记录」不会删除任何本地文件</strong>。
+      </p>
+      <template #footer>
+        <n-space justify="end">
+          <n-button quaternary @click="batchDeleteOpen = false">取消</n-button>
+          <n-button type="primary" :loading="batchBusy" @click="doBatchRemove(false)">仅移除记录</n-button>
+          <n-button type="error" :loading="batchBusy" @click="doBatchRemove(true)">移除并删除文件</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <!-- 批量编辑元数据（分类 / 作者 / 追加标签 / 备注） -->
+    <n-modal
+      :show="batchEditOpen"
+      preset="card"
+      style="width: 500px"
+      title="批量修改元数据"
+      @update:show="(v: boolean) => !v && (batchEditOpen = false)"
+    >
+      <n-space vertical :size="14">
+        <div class="batch-edit-row">
+          <span class="batch-edit-label">分类</span>
+          <n-select v-model:value="batchCat" :options="batchCatOptions" style="flex: 1" />
+        </div>
+        <div class="batch-edit-row">
+          <span class="batch-edit-label">作者</span>
+          <n-select v-model:value="batchAuthor" :options="batchAuthorOptions" style="flex: 1" />
+        </div>
+        <div class="batch-edit-row">
+          <span class="batch-edit-label">追加标签</span>
+          <n-select
+            v-model:value="batchTags"
+            multiple
+            :options="batchTagOptions"
+            placeholder="选择要追加的标签（仅已有标签）"
+            style="flex: 1"
+          />
+        </div>
+        <div class="batch-edit-row" style="align-items: flex-start">
+          <span class="batch-edit-label">备注</span>
+          <div style="flex: 1">
+            <n-input v-model:value="batchRemark" type="textarea" :rows="2" placeholder="填写后覆盖所选记录的备注；不填保持原样" />
+            <div style="margin-top: 6px">
+              <n-checkbox v-model:checked="batchRemarkClear">清空所选记录的备注</n-checkbox>
+            </div>
+          </div>
+        </div>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button quaternary @click="batchEditOpen = false">取消</n-button>
+          <n-button type="primary" :loading="batchBusy" @click="applyBatchEdit">
+            应用到 {{ selectedCount }} 条
+          </n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
     <!-- 清空全部确认 -->
     <n-modal
       :show="clearAllOpen"
@@ -424,7 +820,7 @@ async function doClearAll(): Promise<void> {
       @update:show="(v: boolean) => !v && (clearAllOpen = false)"
     >
       <p class="del-text">
-        将移除<strong>全部</strong>视频记录、缩略图与元数据（共 {{ total }} 条），
+        将移除<strong>全部</strong>视频记录、缩略图与元数据（整个数据库共 {{ dbTotal }} 条，不受当前筛选影响），
         <strong>不会删除任何本地文件</strong>。此操作不可撤销。
       </p>
       <template #footer>
@@ -450,7 +846,7 @@ async function doClearAll(): Promise<void> {
       <template #footer>
         <n-space justify="end">
           <n-button quaternary @click="deleteTarget = null">取消</n-button>
-          <n-button :loading="deleting" @click="doRemove(false)">仅移除记录</n-button>
+          <n-button type="primary" :loading="deleting" @click="doRemove(false)">仅移除记录</n-button>
           <n-button type="error" :loading="deleting" @click="doRemove(true)">移除并删除文件</n-button>
         </n-space>
       </template>
@@ -525,8 +921,17 @@ async function doClearAll(): Promise<void> {
 .thumb-wrap {
   position: relative;
   aspect-ratio: 16 / 9;
-  background: var(--bg-hover);
+  /* 与视频库横屏封面模式一致：黑底、图片等比例居中，不裁剪 */
+  background: #000;
   cursor: pointer;
+}
+
+.thumb-wrap :deep(.thumb) {
+  object-fit: contain;
+}
+
+.thumb-wrap :deep(.thumb-placeholder) {
+  color: rgba(255, 255, 255, 0.35);
 }
 
 .dur {
@@ -556,7 +961,7 @@ async function doClearAll(): Promise<void> {
 
 .fav-btn {
   position: absolute;
-  left: 8px;
+  right: 8px;
   top: 8px;
   width: 28px;
   height: 28px;
@@ -651,13 +1056,22 @@ async function doClearAll(): Promise<void> {
 
 .list-thumb {
   position: relative;
-  width: 120px;
-  height: 68px;
+  width: 128px;
+  aspect-ratio: 16 / 9;
   flex-shrink: 0;
   border-radius: 8px;
   overflow: hidden;
-  background: var(--bg-hover);
+  /* 与视频库横屏封面模式一致：黑底、图片等比例居中，不裁剪 */
+  background: #000;
   cursor: pointer;
+}
+
+.list-thumb :deep(.thumb) {
+  object-fit: contain;
+}
+
+.list-thumb :deep(.thumb-placeholder) {
+  color: rgba(255, 255, 255, 0.35);
 }
 
 .list-body {
@@ -702,5 +1116,123 @@ async function doClearAll(): Promise<void> {
   color: var(--text-1);
   font-size: 14px;
   word-break: break-all;
+}
+
+/* ---- 多选批量模式 ---- */
+.card,
+.list-item {
+  position: relative;
+  transition: border-color 0.15s, box-shadow 0.15s;
+  cursor: default;
+}
+
+.card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1.5px var(--accent), var(--shadow-card);
+}
+
+.card.selected::after {
+  content: '✓';
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.list-item.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.list-item.selected::after {
+  content: '✓';
+  position: absolute;
+  right: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.batch-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 20;
+  margin-top: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--accent);
+  box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.batch-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.batch-count {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.batch-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border-strong);
+  margin: 0 2px;
+}
+
+.batch-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.batch-edit-label {
+  width: 62px;
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.muted-inline {
+  color: var(--text-3);
+  font-size: 12px;
 }
 </style>

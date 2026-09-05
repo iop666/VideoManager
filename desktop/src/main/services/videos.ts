@@ -1,5 +1,9 @@
 import { getDb } from '../db'
+import { existsSync, rmSync } from 'node:fs'
 import type {
+  BatchRemoveResult,
+  BatchVideoPatch,
+  BatchVideoResult,
   DuplicateGroup,
   KeyframeShot,
   VideoListQuery,
@@ -292,4 +296,97 @@ function attachTags(ids: number[], items: VideoListItem[]): void {
     byId.set(r.video_id, list)
   }
   for (const item of items) item.tags = byId.get(item.id) ?? []
+}
+
+/** 单事务辅助（批量操作整体成功或整体回滚） */
+function withTx<T>(fn: () => T): T {
+  const db = getDb()
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const result = fn()
+    db.exec('COMMIT')
+    return result
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK')
+    } catch {
+      /* ignore */
+    }
+    throw err
+  }
+}
+
+/** 批量修改字段（收藏/评分/备注/分类/作者；分类/作者/备注 null = 清除） */
+export function batchUpdateVideos(ids: number[], patch: BatchVideoPatch): BatchVideoResult {
+  const list = [...new Set(ids.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0))]
+  if (list.length === 0) return { ok: true, updated: 0 }
+  withTx(() => {
+    for (const id of list) updateVideo(id, patch)
+  })
+  return { ok: true, updated: list.length }
+}
+
+/** 批量追加标签（与已有标签合并去重；标签必须已存在，沿用单条最多 10 个的上限） */
+export function batchAppendTags(ids: number[], tagNames: string[]): BatchVideoResult {
+  const list = [...new Set(ids.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0))]
+  if (list.length === 0) return { ok: true, updated: 0 }
+  const names = [...new Set(tagNames.map((t) => String(t).trim()).filter(Boolean))]
+  if (names.length === 0) return { ok: false, error: '未选择标签', updated: 0 }
+  const db = getDb()
+  const found = db
+    .prepare(`SELECT name FROM tags WHERE name IN (${names.map(() => '?').join(',')})`)
+    .all(...names) as unknown as Array<{ name: string }>
+  const foundSet = new Set(found.map((f) => f.name))
+  const missing = names.filter((n) => !foundSet.has(n))
+  if (missing.length > 0) return { ok: false, error: `标签不存在：${missing.join('、')}`, updated: 0 }
+  const currentRows = db
+    .prepare(
+      `SELECT vt.video_id, t.name FROM video_tags vt JOIN tags t ON t.id = vt.tag_id
+       WHERE vt.video_id IN (${list.map(() => '?').join(',')})`
+    )
+    .all(...list) as unknown as Array<{ video_id: number; name: string }>
+  const current = new Map<number, string[]>()
+  for (const row of currentRows) {
+    const arr = current.get(row.video_id) ?? []
+    arr.push(row.name)
+    current.set(row.video_id, arr)
+  }
+  withTx(() => {
+    for (const id of list) {
+      const union = [...new Set([...(current.get(id) ?? []), ...names])].slice(0, 10)
+      setVideoTags(id, union)
+    }
+  })
+  return { ok: true, updated: list.length }
+}
+
+/** 批量删除记录（与单条删除语义一致：deleteFile=true 时删除真实本地文件；封面/关键帧由 GC 清理） */
+export function batchRemoveVideos(ids: number[], deleteFile: boolean): BatchRemoveResult {
+  const list = [...new Set(ids.map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0))]
+  if (list.length === 0) return { ok: true, removed: 0, deletedFiles: 0 }
+  const db = getDb()
+  const sel = db.prepare('SELECT id, file_path FROM videos WHERE id = ?')
+  const del = db.prepare('DELETE FROM videos WHERE id = ?')
+  let deletedFiles = 0
+  withTx(() => {
+    for (const id of list) {
+      const row = sel.get(id) as { id: number; file_path: string } | undefined
+      if (!row) continue
+      if (
+        deleteFile &&
+        row.file_path &&
+        !row.file_path.startsWith('restored://') &&
+        existsSync(row.file_path)
+      ) {
+        try {
+          rmSync(row.file_path, { force: true })
+          deletedFiles++
+        } catch {
+          /* 文件删除失败不阻断记录移除 */
+        }
+      }
+      del.run(id)
+    }
+  })
+  return { ok: true, removed: list.length, deletedFiles }
 }

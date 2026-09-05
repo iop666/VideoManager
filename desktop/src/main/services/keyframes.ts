@@ -6,6 +6,7 @@ import { app } from 'electron'
 import { getDb, getSetting } from '../db'
 import { resolveFfmpegPaths } from './ffmpeg'
 import { probeMedia } from './mediaInfo'
+import { waitIfPaused, type TaskControl } from './taskControl'
 import type { KeyframeShot } from '../../shared/types'
 
 const execFileAsync = promisify(execFile)
@@ -32,6 +33,7 @@ export interface KeyframeBacklogResult {
  */
 export async function generateKeyframesForFolder(
   folderPrefix: string,
+  control?: TaskControl,
   onProgress?: (current: number, total: number) => void
 ): Promise<KeyframeBacklogResult> {
   const result: KeyframeBacklogResult = { videos: 0, frames: 0, skipped: 0 }
@@ -72,6 +74,8 @@ export async function generateKeyframesForFolder(
     for (const row of need) {
       idx++
       onProgress?.(idx, total)
+      // 协作检查点：暂停/取消在每个视频开始前生效
+      await waitIfPaused(control)
       try {
         let duration = row.duration
         let fps = row.fps

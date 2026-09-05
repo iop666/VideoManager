@@ -7,6 +7,7 @@ import { getDb, getSetting } from '../db'
 import { resolveFfmpegPaths } from './ffmpeg'
 import { probeMedia } from './mediaInfo'
 import { generateThumbnail } from './thumbnailer'
+import { waitIfPaused, type TaskControl } from './taskControl'
 
 export const VIDEO_EXTENSIONS = new Set([
   '.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm',
@@ -33,6 +34,8 @@ export interface ScanResult {
 
 export interface ScanOptions {
   recursive: boolean
+  /** 任务取消/暂停控制令牌（每个文件边界检查一次） */
+  control?: TaskControl
   onProgress?: (p: ScanProgress) => void
 }
 
@@ -123,6 +126,8 @@ export async function scanFolder(folder: string, options: ScanOptions): Promise<
 
   for (let i = 0; i < total; i++) {
     const file = files[i]
+    // 协作检查点：暂停/取消在当前文件开始前生效（取消粒度 = 单个文件）
+    await waitIfPaused(options.control)
     seen.add(file)
     options.onProgress?.({ phase: 'probe', current: i + 1, total })
 

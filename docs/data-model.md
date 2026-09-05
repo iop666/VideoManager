@@ -121,6 +121,31 @@ CREATE TABLE IF NOT EXISTS settings (
 -- 默认值（由代码写入）：server_port=8720, thumbnail_dir=<userData>/thumbnails
 ```
 
+### restore_logs — 备份恢复/回滚操作日志
+
+```sql
+CREATE TABLE IF NOT EXISTS restore_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    kind         TEXT    NOT NULL,             -- restore | rollback
+    mode         TEXT,                          -- full | backup-first | local-first | missing-only
+    backup_file  TEXT,
+    snapshot_dir TEXT,                          -- 本次恢复创建的快照目录（回滚目标）
+    summary      TEXT,                          -- 差异摘要 JSON（backupOnly/localOnly/conflict/identical…）
+    stats        TEXT,                          -- 执行统计 JSON（inserted/updated/gcRemoved…）
+    detail       TEXT,                          -- 逐条动作 JSON 数组 [{sha256, action}]
+    result       TEXT    NOT NULL DEFAULT 'ok', -- ok | failed | rolled_back
+    error        TEXT,
+    elapsed_ms   INTEGER
+);
+```
+
+> 安全恢复相关机制（实现于 `services/restore.ts`）：
+> - 恢复前先校验备份 zip 完整性并做差异分析（不落盘）；恢复执行前自动在 `restore-snapshots/` 创建数据库快照（wal_checkpoint 后复制主库文件，封面/关键帧等图片目录共享不复制），可一键回滚。
+> - 恢复对数据库的改动在单个事务内（全有或全无）；封面/关键帧属可重建文件，写入失败仅警告。
+> - 回滚用快照替换整个数据库，原恢复日志行随之回到恢复前状态，因此回滚后会在快照库中写入一条 `kind='rollback'` 日志并携带原恢复信息。
+> - 引用计数与物理删除分离：删除记录/恢复完成后，仅清理 sha256 引用计数归零的孤儿封面（`thumbnails/<sha256>.jpg`）与关键帧（`keyframe/Keyframe_<sha256>_NN.jpg`），用户磁盘上的视频文件永不自动删除。
+
 ## 2. Android 端本地库
 
 ### downloaded_videos — 下载记录

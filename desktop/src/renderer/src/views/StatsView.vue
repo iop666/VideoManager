@@ -148,6 +148,10 @@ function goToCategoryFilter(id: number): void {
 function goToTagFilter(id: number): void {
   router.push({ path: '/library', query: { tagId: String(id) } })
 }
+
+function goToAuthorFilter(id: number): void {
+  router.push({ path: '/library', query: { authorId: String(id) } })
+}
 </script>
 
 <template>
@@ -190,6 +194,7 @@ function goToTagFilter(id: number): void {
           <span class="orient-item">方形 <b>{{ stats.orientation.square }}</b></span>
           <n-button size="tiny" quaternary @click="router.push({ path: '/library', query: { orientation: 'landscape' } })">查看横屏</n-button>
           <n-button size="tiny" quaternary @click="router.push({ path: '/library', query: { orientation: 'portrait' } })">查看竖屏</n-button>
+          <n-button size="tiny" quaternary @click="router.push({ path: '/library', query: { orientation: 'square' } })">查看方形</n-button>
         </div>
 
         <!-- 分类管理（横向列表） -->
@@ -218,10 +223,12 @@ function goToTagFilter(id: number): void {
           :items="sortedAuthors"
           :sort-by="sortState.author.by"
           :sort-dir="sortState.author.dir"
+          :show-view="true"
           empty-text="暂无作者"
           @update:sort-by="(v) => (sortState.author.by = v)"
           @update:sort-dir="(v) => (sortState.author.dir = v)"
           @create="openCreate('author')"
+          @view="goToAuthorFilter"
           @rename="(id, name, color) => renameItem('author', id, name, color)"
           @remove="(id) => removeItem('author', id)"
         />

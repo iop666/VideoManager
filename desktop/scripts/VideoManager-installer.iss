@@ -14,7 +14,7 @@
 #endif
 
 #define MyAppName "VideoManager"
-#define MyAppVersion "0.5.1"
+#define MyAppVersion "0.6.0"
 #define MyAppPublisher "VideoManager"
 #define MyAppExeName "VideoManager.exe"
 

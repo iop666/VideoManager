@@ -161,6 +161,33 @@ export interface VideoUpdateFields {
   categoryId?: number | null
 }
 
+/** 批量修改字段（标题不支持批量）；分类/作者/备注 null = 清除 */
+export type BatchVideoPatch = Pick<
+  VideoUpdateFields,
+  'rating' | 'remark' | 'author' | 'authorId' | 'isFavorite' | 'categoryId'
+>
+
+export interface BatchVideoResult {
+  ok: boolean
+  error?: string
+  updated: number
+}
+
+export interface BatchRemoveResult {
+  ok: boolean
+  error?: string
+  /** 移除的记录数 */
+  removed: number
+  /** 实际删除的用户视频文件数 */
+  deletedFiles: number
+}
+
+/** 单任务操作结果（取消/暂停/继续/重试/删除） */
+export interface TaskActionResult {
+  ok: boolean
+  error?: string
+}
+
 export interface Author {
   id: number
   name: string
@@ -311,4 +338,103 @@ export interface StatsSummary {
   duplicates: DuplicateGroup[]
   /** 已计算 SHA-256 身份的视频数 */
   hashedVideos: number
+}
+
+// ================= 备份恢复安全重构（可预览 / 可配置 / 可回滚） =================
+
+/** 恢复模式 */
+export type RestoreMode = 'full' | 'backup-first' | 'local-first' | 'missing-only'
+
+/** 差异条目类别 */
+export type RestoreDiffKind = 'backupOnly' | 'localOnly' | 'conflict' | 'identical'
+
+/** 恢复前差异摘要（备份 vs 本地库，以 SHA-256 身份为键） */
+export interface RestoreSummary {
+  /** 备份内去重后的有效条目数 */
+  backupTotal: number
+  /** 备份内重复 SHA-256 的条数（自动合并，仅保留首个） */
+  duplicatesInBackup: number
+  /** 无效条目数（SHA-256 非法等，被忽略） */
+  invalidEntries: number
+  /** 本地库中已建立 SHA-256 身份的记录数 */
+  localTotal: number
+  /** 仅备份有（本地缺失） */
+  backupOnly: number
+  /** 仅本地有（备份缺失） */
+  localOnly: number
+  /** 两边都有但元数据不一致 */
+  conflict: number
+  /** 两边都有且元数据完全一致 */
+  identical: number
+  /** 备份条目中缺少对应 images/<sha256>.jpg 的封面数（图片可重建，警告） */
+  missingCovers: number
+  /** 是否为旧版备份格式（无 meta 头部的裸数组） */
+  legacy: boolean
+}
+
+/** 差异明细条目 */
+export interface RestoreDiffItem {
+  kind: RestoreDiffKind
+  sha256: string
+  backupTitle: string | null
+  localTitle: string | null
+  backupCategory: string | null
+  localCategory: string | null
+  backupTags: string[]
+  localTags: string[]
+  backupAuthor: string | null
+  localAuthor: string | null
+  /** 冲突字段名（title/category/tags/author/rating/remark/favorite） */
+  conflictFields: string[]
+}
+
+/** 恢复执行结果统计 */
+export interface RestoreStats {
+  inserted: number
+  updated: number
+  /** 因模式（完全恢复）被移除的本地独有记录数 */
+  removed: number
+  skipped: number
+  coversWritten: number
+  coversFailed: number
+  keyframesWritten: number
+  keyframesFailed: number
+  /** 垃圾回收清理的孤儿封面/关键帧文件数 */
+  gcRemoved: number
+  elapsedMs: number
+}
+
+export interface RestoreExecuteResult {
+  ok: boolean
+  error?: string
+  /** restore_logs 行 id */
+  logId?: number
+  /** 本次恢复自动创建的快照目录（可回滚到此处） */
+  snapshotDir?: string | null
+  stats?: RestoreStats
+}
+
+/** 恢复/回滚日志（restore_logs 表行） */
+export interface RestoreLog {
+  id: number
+  createdAt: string
+  kind: 'restore' | 'rollback'
+  mode: RestoreMode | null
+  backupFile: string | null
+  snapshotDir: string | null
+  /** 差异摘要 JSON */
+  summary: RestoreSummary | null
+  /** 执行统计 JSON */
+  stats: RestoreStats | null
+  result: 'ok' | 'failed' | 'rolled_back'
+  error: string | null
+  elapsedMs: number | null
+}
+
+export interface RestorePlanResult {
+  ok: boolean
+  error?: string
+  /** 备份文件名 */
+  backupName?: string
+  summary?: RestoreSummary
 }

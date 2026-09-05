@@ -157,7 +157,8 @@ const dirOptions: { label: string; value: SortDir }[] = [
 
 const orientationOptions: { label: string; value: Orientation }[] = [
   { label: '横屏', value: 'landscape' },
-  { label: '竖屏', value: 'portrait' }
+  { label: '竖屏', value: 'portrait' },
+  { label: '方形', value: 'square' }
 ]
 
 const categoryOptions = computed(() => meta.categoryOptions())

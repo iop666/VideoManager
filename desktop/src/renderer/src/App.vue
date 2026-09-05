@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref, watch, type Component } from 'vue'
+import { computed, h, onMounted, onUnmounted, ref, watch, type Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useImportStore } from './stores/import'
 import { useThemeStore } from './stores/theme'
@@ -32,6 +32,7 @@ import {
   InformationCircleOutline
 } from '@vicons/ionicons5'
 import { ACCENTS, buildThemeOverrides } from './theme'
+import brandLogo from './assets/brand-logo.png'
 
 const route = useRoute()
 const router = useRouter()
@@ -58,6 +59,19 @@ watch(
   () => applyThemeAttr()
 )
 
+// ===== 局域网服务状态（侧栏指示；服务在设置页启停，此处只读展示）=====
+const serverRunning = ref(false)
+let serverStatusTimer: number | undefined
+
+async function refreshServerStatus(): Promise<void> {
+  try {
+    const s = await window.api.getServerStatus()
+    serverRunning.value = s?.running === true
+  } catch {
+    serverRunning.value = false
+  }
+}
+
 onMounted(() => {
   importStore.subscribe()
   void importStore.loadFolders()
@@ -67,6 +81,12 @@ onMounted(() => {
   void appStore.loadMetaEditSort()
   // 同步主题到系统 chrome（Windows 标题栏颜色）
   void window.api.setThemeSource(themeStore.mode)
+  void refreshServerStatus()
+  serverStatusTimer = window.setInterval(() => void refreshServerStatus(), 15000)
+})
+
+onUnmounted(() => {
+  if (serverStatusTimer !== undefined) window.clearInterval(serverStatusTimer)
 })
 
 watch(
@@ -74,6 +94,12 @@ watch(
   (m) => {
     void window.api.setThemeSource(m)
   }
+)
+
+// 从设置页切回时立即刷新一次服务状态
+watch(
+  () => route.path,
+  () => void refreshServerStatus()
 )
 
 function renderIcon(icon: Component): () => ReturnType<typeof h> {
@@ -194,7 +220,7 @@ const accentSoftCss = computed(() => {
               :class="{ 'app-sider-collapsed': siderCollapsed }"
             >
               <div class="brand" :class="{ 'brand-collapsed': siderCollapsed }">
-                <div class="brand-logo">▶</div>
+                <img class="brand-logo" :src="brandLogo" alt="VideoManager" draggable="false" />
                 <div v-if="!siderCollapsed" class="brand-text">
                   <div class="brand-name">VideoManager</div>
                   <div class="brand-sub">本地视频管理</div>
@@ -233,7 +259,10 @@ const accentSoftCss = computed(() => {
                 >
                   <MenuOutline class="sider-toggle-icon" :size="18" />
                 </button>
-                <span v-if="!siderCollapsed" class="sider-status"><span class="dot" /> 服务已启动</span>
+                <span v-if="!siderCollapsed" class="sider-status">
+                  <span class="dot" :class="{ 'dot-off': !serverRunning }" />
+                  {{ serverRunning ? '服务已启动' : '服务未启动' }}
+                </span>
               </div>
             </aside>
             <n-layout>
@@ -300,14 +329,10 @@ const accentSoftCss = computed(() => {
   width: 34px;
   height: 34px;
   border-radius: 10px;
-  background: linear-gradient(135deg, var(--accent), var(--accent));
-  color: #fff;
-  font-size: 14px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  object-fit: cover;
   box-shadow: 0 2px 8px var(--accent-soft);
   flex-shrink: 0;
+  user-select: none;
 }
 
 .brand-text {
@@ -440,6 +465,11 @@ const accentSoftCss = computed(() => {
   border-radius: 50%;
   background: var(--success);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.dot-off {
+  background: var(--text-3);
+  box-shadow: 0 0 0 3px var(--bg-hover);
 }
 
 .header {

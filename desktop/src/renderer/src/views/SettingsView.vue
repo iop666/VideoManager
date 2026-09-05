@@ -18,12 +18,14 @@ import {
   useDialog,
   useMessage
 } from 'naive-ui'
-import { RefreshOutline, SaveOutline, SearchOutline, StopOutline, CloudUploadOutline, FolderOpenOutline, ArchiveOutline } from '@vicons/ionicons5'
+import { RefreshOutline, SaveOutline, SearchOutline, StopOutline, CloudUploadOutline, FolderOpenOutline, ArchiveOutline, TimeOutline } from '@vicons/ionicons5'
 import { useAppStore } from '../stores/app'
 import { useThemeStore } from '../stores/theme'
 import { ACCENTS, type AccentKey, type ThemeMode } from '../theme'
 import { PAGE_SIZE_MAX, PAGE_SIZE_MIN } from '../../../shared/types'
 import type { MetaSortConfig, ServerStatus } from '../../../shared/types'
+import RestoreDialog from '../components/RestoreDialog.vue'
+import RestoreHistoryModal from '../components/RestoreHistoryModal.vue'
 
 const store = useAppStore()
 const theme = useThemeStore()
@@ -42,8 +44,6 @@ const themeModeOptions = [
   { label: '明亮', value: 'light' as ThemeMode },
   { label: '深色', value: 'dark' as ThemeMode }
 ]
-
-const metaBusy = ref(false)
 
 /** 每页显示（仅保留自定义 2-525，默认 42） */
 const pageSizeInput = ref(42)
@@ -81,6 +81,10 @@ const backupCount = ref(0)
 const backupLastAt = ref<string | null>(null)
 const backupBusy = ref(false)
 
+/** 恢复向导 / 恢复记录弹窗 */
+const restoreShow = ref(false)
+const restoreHistoryShow = ref(false)
+
 async function loadBackup(): Promise<void> {
   const res = await window.api.getMetaBackup()
   backupDir.value = res.dir
@@ -116,39 +120,6 @@ async function doBackupNow(): Promise<void> {
     }
   } finally {
     backupBusy.value = false
-  }
-}
-
-/** 恢复备份：删除当前全部数据后恢复 */
-async function doRestoreMeta(): Promise<void> {
-  metaBusy.value = true
-  try {
-    // 第一步：选备份文件并解析统计
-    const preview = await window.api.restoreMetaBackup()
-    if (!preview.ok) {
-      message.error(preview.error ?? '恢复失败')
-      return
-    }
-    // 确认：恢复会删除当前全部数据
-    const action = await new Promise<'restore' | 'cancel'>((resolve) => {
-      dialog.warning({
-        title: '恢复备份',
-        content: `将删除当前全部 ${preview.total ?? 0} 条视频数据与元数据，然后恢复所选备份。此操作不可撤销，确认继续？`,
-        positiveText: '确认恢复',
-        negativeText: '取消',
-        onPositiveClick: () => resolve('restore'),
-        onNegativeClick: () => resolve('cancel'),
-        onClose: () => resolve('cancel'),
-        onMaskClick: () => resolve('cancel')
-      })
-    })
-    if (action === 'cancel') return
-    // 第二步：确认后删除全部并恢复
-    const res = await window.api.restoreMetaBackup(true)
-    if (res.ok) message.success(`已恢复 ${res.count} 条视频元数据`)
-    else message.error(res.error ?? '恢复失败')
-  } finally {
-    metaBusy.value = false
   }
 }
 
@@ -225,6 +196,22 @@ async function stopServer(): Promise<void> {
   await window.api.stopServer()
   await refreshServerStatus()
   message.info('服务已停止')
+}
+
+/** 手动选择 PotPlayer 可执行文件 */
+async function choosePlayerFile(): Promise<void> {
+  const p = await window.api.selectPlayerFile()
+  if (!p) return
+  potPlayerPath.value = p
+  await window.api.savePotPlayerPath(p)
+  message.success('PotPlayer 路径已设置')
+}
+
+/** 打开 GitHub 上的接口契约文档 */
+const API_CONTRACT_URL = 'https://github.com/iop666/VideoManager/blob/main/docs/api-contract.md'
+async function openApiContract(): Promise<void> {
+  const res = await window.api.openExternal(API_CONTRACT_URL)
+  if (!res.ok) message.error(res.error ?? '无法打开链接')
 }
 </script>
 
@@ -319,6 +306,12 @@ async function stopServer(): Promise<void> {
           </template>
           检测
         </n-button>
+        <n-button :loading="detecting" @click="choosePlayerFile">
+          <template #icon>
+            <n-icon><FolderOpenOutline /></n-icon>
+          </template>
+          选择…
+        </n-button>
         <n-button type="primary" @click="savePotPlayer">
           <template #icon>
             <n-icon><SaveOutline /></n-icon>
@@ -343,11 +336,17 @@ async function stopServer(): Promise<void> {
             </template>
             立即备份
           </n-button>
-          <n-button size="small" :loading="metaBusy" @click="doRestoreMeta">
+          <n-button size="small" type="primary" @click="restoreShow = true">
             <template #icon>
               <n-icon><CloudUploadOutline /></n-icon>
             </template>
             恢复备份
+          </n-button>
+          <n-button size="small" quaternary @click="restoreHistoryShow = true">
+            <template #icon>
+              <n-icon><TimeOutline /></n-icon>
+            </template>
+            恢复记录
           </n-button>
         </div>
         <div class="appearance-row" style="margin-top: 10px">
@@ -364,7 +363,13 @@ async function stopServer(): Promise<void> {
           最近备份：{{ backupLastAt }} · 可备份 {{ backupCount }} 条视频元数据
         </div>
       </div>
+      <n-alert type="info" :show-icon="false" style="margin-top: 12px">
+        恢复前会先校验备份完整性、对比本地差异，并自动创建可回滚的快照；支持完全恢复 / 备份优先 / 本地优先 / 仅补缺四种模式。封面与关键帧等生成文件仅在引用计数归零后由垃圾回收清理，不会删除你的视频文件。
+      </n-alert>
     </n-card>
+
+    <RestoreDialog v-model:show="restoreShow" />
+    <RestoreHistoryModal v-model:show="restoreHistoryShow" />
 
     <n-card title="局域网服务（Android 端连接）" size="small" style="max-width: 720px; margin-top: 16px">
       <n-space align="center" style="margin-bottom: 12px">
@@ -421,7 +426,8 @@ async function stopServer(): Promise<void> {
       <n-alert type="info" :show-icon="false" style="margin-top: 12px">
         连接手机功能默认关闭（应用启动时不自动开启）。需要手机连接时，点击上方「应用并重启」开启服务；本机将记住选择，下次启动保持。
         手机与电脑需在同一局域网（Wi-Fi）。首次连接时手机发起配对，此处会显示 6 位配对码，输入到手机即可。
-        首次启动若弹出 Windows 防火墙提示，请选择「允许访问」。接口契约见 <code>docs/api-contract.md</code>。
+        首次启动若弹出 Windows 防火墙提示，请选择「允许访问」。接口契约见
+         <a class="api-contract-link" @click="openApiContract">github.com/iop666/VideoManager 的 docs/api-contract.md</a>。
       </n-alert>
     </n-card>
   </div>
@@ -509,5 +515,15 @@ async function stopServer(): Promise<void> {
 
 .swatch-name {
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+.api-contract-link {
+  color: var(--accent, #ff8533);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.api-contract-link:hover {
+  opacity: 0.85;
 }
 </style>

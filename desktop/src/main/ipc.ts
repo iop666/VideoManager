@@ -1,10 +1,10 @@
 import { app, dialog, ipcMain, BrowserWindow, nativeTheme, shell } from 'electron'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { getDb, getDbPath, getDbStats } from './db'
 import { resolveFfmpegPaths } from './services/ffmpeg'
 import { listTasks, TaskQueue } from './services/taskQueue'
-import { listVideos, getVideoDetail, updateVideo, setVideoTags, recordPlay, findDuplicates } from './services/videos'
+import { listVideos, getVideoDetail, updateVideo, setVideoTags, recordPlay, findDuplicates, batchAppendTags, batchRemoveVideos, batchUpdateVideos } from './services/videos'
 import {
   addAuthor,
   addCategory,
@@ -25,13 +25,26 @@ import { detectPotPlayer, playWithPotPlayer, savePotPlayerPath } from './service
 import { getServerStatus, startHttpServer, stopHttpServer } from './services/httpServer'
 import { getStatsSummary } from './services/stats'
 import { collectVideoFilesInFolder, inspectFiles } from './services/converter'
-import { buildExportZip, parseExportZip, importExportZip } from './services/metaZip'
+import { buildExportZip } from './services/metaZip'
 import { keyframeDir } from './services/keyframes'
+import {
+  buildDiff,
+  executeRestore,
+  listRestoreLogs,
+  loadZipManifest,
+  rollbackByLogId,
+  sweepOrphanAssets,
+  type ZipManifest
+} from './services/restore'
 import { getSetting, setSetting } from './db'
 import { PAGE_SIZE_MAX, PAGE_SIZE_MIN } from '../shared/types'
 import type {
   AppInfo,
   Author,
+  BatchRemoveResult,
+  BatchVideoPatch,
+  BatchVideoResult,
+  TaskActionResult,
   Category,
   ConvertFileInfo,
   ConvertItem,
@@ -45,6 +58,13 @@ import type {
   RenamePreviewItem,
   RenameResult,
   RenameRules,
+  RestoreDiffItem,
+  RestoreDiffKind,
+  RestoreExecuteResult,
+  RestoreLog,
+  RestoreMode,
+  RestorePlanResult,
+  RestoreSummary,
   ServerStatus,
   StatsSummary,
   Tag,
@@ -74,7 +94,7 @@ function resolveAppVersion(): string {
   const v = app.getVersion()
   // 排除 Electron 自身版本（44.x 等非项目版本）
   if (v && !/^44\./.test(v)) return v
-  return '0.5.1'
+  return '0.6.0'
 }
 
 /** 北京时间文件名时间戳（YYYY-MM-DDTHH-mm-ss，东八区） */
@@ -87,9 +107,6 @@ function beijingStamp(): string {
 
 /** 注册主进程 IPC 处理器（渲染进程通过 preload 的 window.api 调用） */
 export function registerIpcHandlers(taskQueue: TaskQueue): void {
-  /** 导入解析缓存：第一次选择文件后缓存 items，确认覆盖/跳过后再应用（避免二次选文件） */
-  let pendingImportItems: unknown[] | null = null
-
   /** 若开启自动备份，静默备份元数据到备份目录（失败不影响主流程） */
   const maybeAutoBackup = (): void => {
     try {
@@ -198,13 +215,36 @@ export function registerIpcHandlers(taskQueue: TaskQueue): void {
 
   ipcMain.handle('tasks:list', (): Task[] => listTasks(100))
 
-  /** 清空全部任务记录（仅删除记录，不影响正在执行的任务） */
-  ipcMain.handle('tasks:clear', (): { ok: boolean; count: number } => {
-    const db = getDb()
-    const count = (db.prepare('SELECT COUNT(*) AS c FROM tasks').get() as { c: number }).c
-    db.prepare('DELETE FROM tasks').run()
-    return { ok: true, count }
-  })
+  /** 单任务操作统一包装：捕获异常返回 { ok, error } */
+  const runTaskAction = (
+    fn: (id: number) => { ok: boolean; error?: string },
+    id: number
+  ): TaskActionResult => {
+    try {
+      return fn(id)
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  }
+
+  ipcMain.handle('tasks:cancel', (_e, id: number): TaskActionResult =>
+    runTaskAction((x) => taskQueue.cancel(x), id)
+  )
+  ipcMain.handle('tasks:pause', (_e, id: number): TaskActionResult =>
+    runTaskAction((x) => taskQueue.pause(x), id)
+  )
+  ipcMain.handle('tasks:resume', (_e, id: number): TaskActionResult =>
+    runTaskAction((x) => taskQueue.resume(x), id)
+  )
+  ipcMain.handle('tasks:retry', (_e, id: number): TaskActionResult =>
+    runTaskAction((x) => taskQueue.retry(x), id)
+  )
+  ipcMain.handle('tasks:delete', (_e, id: number): TaskActionResult =>
+    runTaskAction((x) => taskQueue.deleteTask(x), id)
+  )
+
+  /** 清空任务历史（仅已完成/失败/已取消；进行中与排队中不受影响） */
+  ipcMain.handle('tasks:clear', (): { ok: boolean; count: number } => taskQueue.clearFinished())
 
   // ============ M3：视频列表与详情 ============
 
@@ -221,6 +261,45 @@ export function registerIpcHandlers(taskQueue: TaskQueue): void {
     setVideoTags(id, tagNames)
     maybeAutoBackup()
   })
+
+  // ============ 批量操作（元数据页多选） ============
+
+  ipcMain.handle(
+    'videos:batch-fields',
+    (_e, ids: number[], patch: BatchVideoPatch): BatchVideoResult => {
+      try {
+        const res = batchUpdateVideos(ids, patch)
+        if (res.ok) maybeAutoBackup()
+        return res
+      } catch (err) {
+        return { ok: false, error: err instanceof Error ? err.message : String(err), updated: 0 }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    'videos:batch-tags',
+    (_e, ids: number[], tagNames: string[]): BatchVideoResult => {
+      const res = batchAppendTags(ids, tagNames)
+      if (res.ok) maybeAutoBackup()
+      return res
+    }
+  )
+
+  ipcMain.handle(
+    'videos:batch-remove',
+    (_e, ids: number[], deleteFile: boolean): BatchRemoveResult => {
+      const res = batchRemoveVideos(ids, deleteFile)
+      if (res.ok) {
+        try {
+          sweepOrphanAssets()
+        } catch {
+          /* GC 失败不影响 */
+        }
+      }
+      return res
+    }
+  )
 
   /** 记录一次播放（播放次数 +1） */
   ipcMain.handle('videos:record-play', (_e, id: number): void => {
@@ -332,46 +411,41 @@ export function registerIpcHandlers(taskQueue: TaskQueue): void {
   )
   ipcMain.handle('authors:remove', (_e, id: number): void => removeAuthor(id))
 
-  /** 清空全部视频数据（移除记录与缩略图，不删除本地文件） */
+  /** 清空全部视频数据（仅移除记录；封面/关键帧等程序生成文件交由引用计数 GC 清理，不删除用户本地文件） */
   ipcMain.handle('videos:clear-all', (): { ok: boolean; count: number } => {
     const db = getDb()
     const count = (db.prepare('SELECT COUNT(*) AS c FROM videos').get() as { c: number }).c
     db.prepare('DELETE FROM videos').run()
     try {
-      const { readdirSync, rmSync } = require('node:fs')
-      const { join } = require('node:path')
-      const thumbDir = getSetting('thumbnail_dir') ?? join(app.getPath('userData'), 'thumbnails')
-      if (existsSync(thumbDir)) {
-        for (const f of readdirSync(thumbDir)) {
-          try {
-            rmSync(join(thumbDir, f), { force: true })
-          } catch {
-            /* ignore */
-          }
-        }
-      }
+      sweepOrphanAssets()
     } catch {
-      /* 缩略图清理失败不影响 */
+      /* GC 失败不影响 */
     }
     return { ok: true, count }
   })
 
-  /** 删除视频记录（可选同时删除本地文件与缩略图） */
+  /**
+   * 删除视频记录。与物理文件解耦：
+   *  - deleteFile=true 且路径指向真实文件 → 删除用户视频文件（用户显式请求）；
+   *  - 封面/关键帧属程序生成物，不在此立即删除，改由引用计数 GC（sweepOrphanAssets）在删除后清理孤儿文件。
+   */
   ipcMain.handle(
     'videos:remove',
     (_e, id: number, deleteFile: boolean): { ok: boolean; error?: string } => {
       const row = getDb()
-        .prepare('SELECT file_path, thumbnail_path FROM videos WHERE id = ?')
-        .get(id) as { file_path: string; thumbnail_path: string | null } | undefined
+        .prepare('SELECT file_path FROM videos WHERE id = ?')
+        .get(id) as { file_path: string } | undefined
       if (!row) return { ok: false, error: '视频不存在' }
       try {
         if (deleteFile && row.file_path && existsSync(row.file_path)) {
           rmSync(row.file_path, { force: true })
         }
-        if (row.thumbnail_path && existsSync(row.thumbnail_path)) {
-          rmSync(row.thumbnail_path, { force: true })
-        }
         getDb().prepare('DELETE FROM videos WHERE id = ?').run(id)
+        try {
+          sweepOrphanAssets()
+        } catch {
+          /* GC 失败不影响 */
+        }
         return { ok: true }
       } catch (err) {
         return { ok: false, error: err instanceof Error ? err.message : String(err) }
@@ -415,6 +489,29 @@ export function registerIpcHandlers(taskQueue: TaskQueue): void {
   )
 
   ipcMain.handle('player:save-path', (_e, path: string): void => savePotPlayerPath(path))
+
+  /** 手动选择 PotPlayer 可执行文件（设置页「选择…」按钮） */
+  ipcMain.handle('dialog:select-player', async (): Promise<string | null> => {
+    const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+    const res = win
+      ? await dialog.showOpenDialog(win, {
+          title: '选择 PotPlayer 可执行文件',
+          properties: ['openFile'],
+          filters: [
+            { name: '可执行文件', extensions: ['exe'] },
+            { name: '所有文件', extensions: ['*'] }
+          ]
+        })
+      : await dialog.showOpenDialog({
+          title: '选择 PotPlayer 可执行文件',
+          properties: ['openFile'],
+          filters: [
+            { name: '可执行文件', extensions: ['exe'] },
+            { name: '所有文件', extensions: ['*'] }
+          ]
+        })
+    return res.canceled || res.filePaths.length === 0 ? null : res.filePaths[0]
+  })
 
   // ============ M7：格式转换（导入制） ============
 
@@ -544,50 +641,84 @@ export function registerIpcHandlers(taskQueue: TaskQueue): void {
     }
   })
 
-  /** 恢复备份：第一步(无 confirm)选文件解析统计；第二步(confirm=true)删除全部数据后恢复 */
-  ipcMain.handle(
-    'settings:meta-restore',
-    async (_e, confirm?: boolean): Promise<{ ok: boolean; count?: number; total?: number; error?: string }> => {
-      const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
-      // 第二步：确认后删除全部并恢复（用缓存的 items）
-      if (confirm === true) {
-        if (!pendingImportItems) return { ok: false, error: '备份数据已过期，请重新选择备份文件' }
-        try {
-          const items = pendingImportItems
-          pendingImportItems = null
-          // 删除当前全部视频数据（记录 + 标签关联）
-          getDb().prepare('DELETE FROM video_tags').run()
-          getDb().prepare('DELETE FROM videos').run()
-          const result = importExportZip(items, { overwrite: false })
-          maybeAutoBackup()
-          return { ok: true, count: result.updated }
-        } catch (err) {
-          return { ok: false, error: err instanceof Error ? err.message : String(err) }
-        }
-      }
-      // 第一步：选备份文件并解析统计
-      const res = win
-        ? await dialog.showOpenDialog(win, {
-            title: '选择备份文件',
-            properties: ['openFile'],
-            filters: [{ name: 'VideoManager 备份', extensions: ['zip'] }]
-          })
-        : await dialog.showOpenDialog({
-            title: '选择备份文件',
-            properties: ['openFile'],
-            filters: [{ name: 'VideoManager 备份', extensions: ['zip'] }]
-          })
-      if (res.canceled || res.filePaths.length === 0) return { ok: false, error: '已取消' }
-      try {
-        const { readFileSync } = await import('node:fs')
-        const buf = new Uint8Array(readFileSync(res.filePaths[0]))
-        const parsed = parseExportZip(buf)
-        pendingImportItems = parsed.items
-        return { ok: true, total: parsed.items.length }
-      } catch (err) {
-        return { ok: false, error: err instanceof Error ? err.message : String(err) }
-      }
+  // ============ 备份恢复（安全重构：可预览 / 可配置 / 可回滚） ============
+
+  /** 待执行恢复的计划缓存（选文件解析后保留，避免二次选文件；不含任何图片数据） */
+  let pendingRestore: {
+    zipPath: string
+    manifest: ZipManifest
+    summary: RestoreSummary
+    kindBySha: Map<string, 'backupOnly' | 'conflict' | 'identical'>
+    items: RestoreDiffItem[]
+  } | null = null
+
+  /** 选择备份文件 → 基础完整性校验 + 与本地差异分析（只读不写盘） */
+  ipcMain.handle('settings:meta-restore-plan', async (): Promise<RestorePlanResult> => {
+    const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+    const res = win
+      ? await dialog.showOpenDialog(win, {
+          title: '选择备份文件',
+          properties: ['openFile'],
+          filters: [{ name: 'VideoManager 备份', extensions: ['zip'] }]
+        })
+      : await dialog.showOpenDialog({
+          title: '选择备份文件',
+          properties: ['openFile'],
+          filters: [{ name: 'VideoManager 备份', extensions: ['zip'] }]
+        })
+    if (res.canceled || res.filePaths.length === 0) return { ok: false, error: '已取消' }
+    const zipPath = res.filePaths[0]
+    const manifest = loadZipManifest(zipPath)
+    if (!manifest.ok) return { ok: false, error: manifest.error }
+    try {
+      const { summary, items, kindBySha } = buildDiff(manifest)
+      pendingRestore = { zipPath, manifest, summary, kindBySha, items }
+      return { ok: true, backupName: basename(zipPath), summary }
+    } catch (err) {
+      pendingRestore = null
+      return { ok: false, error: `差异分析失败：${err instanceof Error ? err.message : String(err)}` }
     }
+  })
+
+  /** 差异明细（kind 过滤；省略返回全部） */
+  ipcMain.handle('settings:meta-restore-diff', (_e, kind?: RestoreDiffKind | null): RestoreDiffItem[] => {
+    if (!pendingRestore) return []
+    return kind ? pendingRestore.items.filter((i) => i.kind === kind) : pendingRestore.items
+  })
+
+  /** 执行恢复：自动快照 → DB 事务 → 图片写回 → 引用计数 GC → 日志 */
+  ipcMain.handle('settings:meta-restore-execute', async (_e, mode: RestoreMode): Promise<RestoreExecuteResult> => {
+    if (!pendingRestore) return { ok: false, error: '请先选择并分析备份文件' }
+    if (!['full', 'backup-first', 'local-first', 'missing-only'].includes(mode)) {
+      return { ok: false, error: '无效的恢复模式' }
+    }
+    const plan = pendingRestore
+    try {
+      const result = await executeRestore({
+        zipPath: plan.zipPath,
+        mode,
+        manifest: plan.manifest,
+        kindBySha: plan.kindBySha,
+        summary: plan.summary
+      })
+      if (result.ok) {
+        // 仅成功才清除计划；失败（DB 事务已回滚）保留以便调整模式重试
+        pendingRestore = null
+        maybeAutoBackup()
+      }
+      return result
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  /** 最近恢复/回滚日志 */
+  ipcMain.handle('settings:meta-restore-logs', (_e, limit?: number): RestoreLog[] => listRestoreLogs(limit))
+
+  /** 回滚到某次恢复前的自动快照（logId 来自恢复日志）；回滚后日志随快照回到恢复前状态，见 restore.rollbackByLogId */
+  ipcMain.handle(
+    'settings:meta-restore-rollback',
+    async (_e, logId: number): Promise<{ ok: boolean; error?: string; gcRemoved?: number }> => rollbackByLogId(logId)
   )
 
   // ============ M8：局域网服务 ============

@@ -118,6 +118,23 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
+-- 恢复操作日志（备份恢复 / 回滚审计）
+CREATE TABLE IF NOT EXISTS restore_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    kind         TEXT    NOT NULL,             -- restore | rollback
+    mode         TEXT,                          -- full | backup-first | local-first | missing-only
+    backup_file  TEXT,
+    snapshot_dir TEXT,                          -- 本次恢复创建的快照目录（回滚目标）
+    summary      TEXT,                          -- 差异摘要 JSON
+    stats        TEXT,                          -- 执行统计 JSON（inserted/updated/gcRemoved…）
+    detail       TEXT,                          -- 逐条动作 JSON 数组 [{sha256, action}]
+    result       TEXT    NOT NULL DEFAULT 'ok', -- ok | failed | rolled_back
+    error        TEXT,
+    elapsed_ms   INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_restore_logs_created ON restore_logs(created_at);
+
 -- 默认设置
 INSERT OR IGNORE INTO settings (key, value) VALUES ('server_port', '8720');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('schema_version', '1');

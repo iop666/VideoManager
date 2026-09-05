@@ -68,6 +68,37 @@ export const useImportStore = defineStore('import', () => {
     for (const t of tasks.value) prevStatus.set(t.id, t.status)
   }
 
+  /** 单任务控制（取消/暂停/继续/重试/删除）；失败抛错由调用方提示 */
+  async function cancelTask(id: number): Promise<void> {
+    const res = await window.api.cancelTask(id)
+    if (!res.ok) throw new Error(res.error ?? '取消失败')
+    await loadTasks()
+  }
+
+  async function pauseTask(id: number): Promise<void> {
+    const res = await window.api.pauseTask(id)
+    if (!res.ok) throw new Error(res.error ?? '暂停失败')
+    await loadTasks()
+  }
+
+  async function resumeTask(id: number): Promise<void> {
+    const res = await window.api.resumeTask(id)
+    if (!res.ok) throw new Error(res.error ?? '继续失败')
+    await loadTasks()
+  }
+
+  async function retryTask(id: number): Promise<void> {
+    const res = await window.api.retryTask(id)
+    if (!res.ok) throw new Error(res.error ?? '重试失败')
+    await loadTasks()
+  }
+
+  async function deleteTask(id: number): Promise<void> {
+    const res = await window.api.deleteTask(id)
+    if (!res.ok) throw new Error(res.error ?? '删除失败')
+    await loadTasks()
+  }
+
   return {
     folders,
     tasks,
@@ -77,6 +108,11 @@ export const useImportStore = defineStore('import', () => {
     addFolder,
     removeFolder,
     scanFolder,
-    loadTasks
+    loadTasks,
+    cancelTask,
+    pauseTask,
+    resumeTask,
+    retryTask,
+    deleteTask
   }
 })

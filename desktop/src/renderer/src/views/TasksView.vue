@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, type Component, onMounted } from 'vue'
+import { computed, type Component, onMounted, ref } from 'vue'
 import {
   NButton,
   NEmpty,
@@ -14,7 +14,7 @@ import {
 } from 'naive-ui'
 import { CheckmarkCircleOutline, CloseCircleOutline, TimeOutline, TrashOutline } from '@vicons/ionicons5'
 import { useImportStore } from '../stores/import'
-import type { TaskStatus, TaskType } from '../../../shared/types'
+import type { Task, TaskStatus, TaskType } from '../../../shared/types'
 
 const store = useImportStore()
 const message = useMessage()
@@ -37,6 +37,9 @@ const TYPE_LABEL: Record<TaskType, string> = {
 
 const tasks = computed(() => store.tasks)
 
+/** 正在执行操作的按钮（用于 loading / 防连点） */
+const busyId = ref<number | null>(null)
+
 /** 任务时间序号：created_at(YYYY-MM-DD HH:MM:SS) → YYYYMMDD-HH:MM:SS-id */
 function taskSerial(t: { created_at: string; id: number }): string {
   const s = (t.created_at ?? '').replace(/[- :]/g, (m) => (m === '-' ? '' : m === ' ' ? '-' : m === ':' ? ':' : m))
@@ -46,14 +49,103 @@ function taskSerial(t: { created_at: string; id: number }): string {
   return `${s}-${t.id}`
 }
 
+/** 按 类型 × 状态 的能力矩阵生成可用操作 */
+type ActionKey = 'pause' | 'resume' | 'cancel' | 'retry' | 'delete'
+interface TaskAction {
+  key: ActionKey
+  label: string
+  danger: boolean
+  /** 二次确认文案（仅破坏性/不可逆操作） */
+  confirm?: string
+}
+
+function actionsFor(t: Task): TaskAction[] {
+  switch (t.status) {
+    case 'pending':
+      return [
+        { key: 'pause', label: '暂停', danger: false },
+        { key: 'cancel', label: '取消', danger: true, confirm: '取消该排队任务？' },
+        { key: 'delete', label: '删除', danger: true, confirm: '删除该排队任务？' }
+      ]
+    case 'running':
+      if (t.type === 'convert') {
+        // ffmpeg 无断点暂停：进行中的转换只允许取消
+        return [
+          {
+            key: 'cancel',
+            label: '取消',
+            danger: true,
+            confirm: '正在转换，取消将丢弃当前进度并清理半成品文件？'
+          }
+        ]
+      }
+      // 扫描在文件边界暂停/取消
+      return [
+        { key: 'pause', label: '暂停', danger: false },
+        {
+          key: 'cancel',
+          label: '取消',
+          danger: true,
+          confirm: '正在扫描，取消将从下一个文件开始停止？'
+        }
+      ]
+    case 'paused':
+      return [
+        { key: 'resume', label: '继续', danger: false },
+        { key: 'cancel', label: '取消', danger: true, confirm: '取消该已暂停任务？' },
+        { key: 'delete', label: '删除', danger: true, confirm: '删除该任务？' }
+      ]
+    case 'failed':
+    case 'cancelled':
+      return [
+        { key: 'retry', label: '重试', danger: false },
+        { key: 'delete', label: '删除', danger: true, confirm: '删除该条记录？' }
+      ]
+    case 'done':
+      return [{ key: 'delete', label: '删除', danger: true, confirm: '删除该条记录？' }]
+  }
+}
+
+async function runAction(t: Task, action: TaskAction): Promise<void> {
+  busyId.value = t.id
+  try {
+    switch (action.key) {
+      case 'pause':
+        await store.pauseTask(t.id)
+        message.success('已暂停（扫描将在当前文件完成后暂停）')
+        break
+      case 'resume':
+        await store.resumeTask(t.id)
+        message.success('已继续')
+        break
+      case 'cancel':
+        await store.cancelTask(t.id)
+        message.success('已请求取消')
+        break
+      case 'retry':
+        await store.retryTask(t.id)
+        message.success('已重新加入队列')
+        break
+      case 'delete':
+        await store.deleteTask(t.id)
+        message.success('已删除')
+        break
+    }
+  } catch (err) {
+    message.error(err instanceof Error ? err.message : '操作失败')
+  } finally {
+    busyId.value = null
+  }
+}
+
 onMounted(() => {
   void store.loadTasks()
 })
 
-async function clearAll(): Promise<void> {
+async function clearFinished(): Promise<void> {
   const res = await window.api.clearTasks()
   await store.loadTasks()
-  message.success(`已清空 ${res.count} 条任务记录`)
+  message.success(`已清空 ${res.count} 条历史记录`)
 }
 </script>
 
@@ -62,16 +154,16 @@ async function clearAll(): Promise<void> {
     <div class="page-head">
       <div>
         <h2>任务</h2>
-        <p class="muted">导入 / 缩略图 / 转码 / 重命名任务队列，实时进度同步。</p>
+        <p class="muted">导入 / 缩略图 / 转码 / 重命名任务队列，实时进度同步；支持单任务暂停 / 继续 / 取消 / 重试 / 删除。</p>
       </div>
-      <n-popconfirm v-if="tasks.length" @positive-click="clearAll">
+      <n-popconfirm v-if="tasks.length" @positive-click="clearFinished">
         <template #trigger>
           <n-button size="small" type="error" secondary>
             <template #icon><n-icon><TrashOutline /></n-icon></template>
             清空任务记录
           </n-button>
         </template>
-        将删除全部 {{ tasks.length }} 条任务记录（正在执行的任务不受影响），确认？
+        将删除全部已完成 / 失败 / 已取消记录（排队中与进行中任务不受影响），确认？
       </n-popconfirm>
     </div>
     <n-list v-if="tasks.length" bordered>
@@ -97,6 +189,41 @@ async function clearAll(): Promise<void> {
             style="margin-top: 8px"
           />
           <div v-if="t.message" class="task-msg">{{ t.message }}</div>
+          <div class="task-actions">
+            <template v-for="a in actionsFor(t)" :key="a.key">
+              <n-popconfirm
+                v-if="a.confirm"
+                :positive-text="'确定'"
+                :negative-text="'取消'"
+                :disabled="busyId === t.id"
+                @positive-click="runAction(t, a)"
+              >
+                <template #trigger>
+                  <n-button
+                    size="tiny"
+                    :type="a.danger ? 'error' : 'default'"
+                    quaternary
+                    :loading="busyId === t.id"
+                    :disabled="busyId !== null && busyId !== t.id"
+                  >
+                    {{ a.label }}
+                  </n-button>
+                </template>
+                {{ a.confirm }}
+              </n-popconfirm>
+              <n-button
+                v-else
+                size="tiny"
+                :type="a.danger ? 'error' : 'default'"
+                quaternary
+                :loading="busyId === t.id"
+                :disabled="busyId !== null && busyId !== t.id"
+                @click="runAction(t, a)"
+              >
+                {{ a.label }}
+              </n-button>
+            </template>
+          </div>
         </div>
       </n-list-item>
     </n-list>
@@ -137,5 +264,12 @@ async function clearAll(): Promise<void> {
   font-size: 12px;
   margin-top: 6px;
   word-break: break-all;
+}
+
+.task-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
 }
 </style>

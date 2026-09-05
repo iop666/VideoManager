@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, nativeImage, shell } from 'electron'
 import { join, dirname } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import { initDatabase, closeDatabase, getSetting } from './db'
+import { initDatabase, closeDatabase, getSetting, getDb } from './db'
 import { registerIpcHandlers } from './ipc'
 import { listTasks, TaskQueue } from './services/taskQueue'
 import { scanFolder } from './services/scanner'
@@ -9,7 +9,14 @@ import { listVideos } from './services/videos'
 import { applyRename, buildRenamePreview, undoRename } from './services/rename'
 import { startHttpServer, stopHttpServer } from './services/httpServer'
 import { convertFile } from './services/converter'
-import type { RenameRules } from '../shared/types'
+import {
+  buildDiff,
+  executeRestore,
+  listRestoreLogs,
+  loadZipManifest,
+  rollbackByLogId
+} from './services/restore'
+import type { RenameRules, RestoreMode } from '../shared/types'
 
 // 数据目录：优先放在软件所在目录（绿色版/便携版/直接运行场景，DB/缩略图等随软件目录走）
 // 若软件目录不可写（如 Program Files 安装版），回退到 %APPDATA%\VideoManager
@@ -222,6 +229,105 @@ app.whenReady().then(async () => {
       console.log('[smoke-convert] RESULT ' + JSON.stringify(result))
     } catch (err) {
       console.error('[smoke-convert] ERROR', err)
+      app.exit(1)
+      return
+    }
+    closeDatabase()
+    app.exit(0)
+    return
+  }
+
+  // 无头冒烟模式：--smoke-restore <backupZip> <mode> [--rollback-after] [--dump] [--rollback-id <id>]
+  // 端到端验证安全恢复链路：校验 → 差异 → 执行（快照/事务/GC/日志）→ 可选立即回滚
+  // 带 --rollback-id <id> 时只执行回滚（用于链式多步回滚验证）
+  const smokeRestoreIndex = process.argv.indexOf('--smoke-restore')
+  if (smokeRestoreIndex !== -1) {
+    const zipPath = process.argv[smokeRestoreIndex + 1]
+    const modeArg = process.argv[smokeRestoreIndex + 2]
+    const rollbackIdIdx = process.argv.indexOf('--rollback-id')
+    const explicitRollback = rollbackIdIdx !== -1
+    const dump = (): void => {
+      const db = getDb()
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM videos').get() as { c: number }).c
+      const rows = db
+        .prepare('SELECT id, title, category_id, author_id, rating, remark, is_favorite, file_path, thumbnail_path, keyframes FROM videos ORDER BY id')
+        .all() as unknown as Array<{ id: number; title: string; file_path: string; thumbnail_path: string | null; keyframes: string | null }>
+      console.log(
+        '[smoke-restore] DUMP count=' + count + ' rows=' +
+          JSON.stringify(rows.map((r) => ({ id: r.id, title: r.title, file_path: r.file_path, thumb: r.thumbnail_path, kf: (r.keyframes ?? '[]').length > 2 })))
+      )
+    }
+    const dumpLogs = (): void => {
+      const logs = listRestoreLogs(20)
+      console.log('[smoke-restore] LOGS ' + JSON.stringify(logs.map((l) => ({ id: l.id, kind: l.kind, mode: l.mode, result: l.result, stats: l.stats }))))
+    }
+    if (explicitRollback) {
+      // 只回滚指定日志（链式回滚验证）
+      const id = Number(process.argv[rollbackIdIdx + 1])
+      if (!Number.isInteger(id)) {
+        console.error('[smoke-restore] --rollback-id 需要日志 id')
+        app.exit(1)
+        return
+      }
+      try {
+        const rb = rollbackByLogId(id)
+        if (!rb.ok) {
+          console.error('[smoke-restore] 回滚失败: ' + rb.error)
+          app.exit(1)
+          return
+        }
+        console.log('[smoke-restore] ROLLBACK(' + id + ') ok')
+      } catch (err) {
+        console.error('[smoke-restore] ERROR', err)
+        app.exit(1)
+        return
+      }
+      if (process.argv.includes('--dump')) {
+        dump()
+        dumpLogs()
+      }
+      closeDatabase()
+      app.exit(0)
+      return
+    }
+    if (!zipPath || !modeArg) {
+      console.error('[smoke-restore] 缺少参数：--smoke-restore <backupZip> <full|backup-first|local-first|missing-only>')
+      app.exit(1)
+      return
+    }
+    const mode = modeArg as RestoreMode
+    try {
+      const manifest = loadZipManifest(zipPath)
+      if (!manifest.ok) {
+        console.error('[smoke-restore] 校验失败: ' + manifest.error)
+        app.exit(1)
+        return
+      }
+      const { summary, kindBySha } = buildDiff(manifest)
+      console.log('[smoke-restore] DIFF ' + JSON.stringify(summary))
+      const res = await executeRestore({ zipPath, mode, manifest, kindBySha, summary })
+      console.log('[smoke-restore] RESULT ' + JSON.stringify(res))
+      if (!res.ok) {
+        console.error('[smoke-restore] 执行失败: ' + res.error)
+        app.exit(1)
+        return
+      }
+      if (process.argv.includes('--rollback-after') && res.logId && res.snapshotDir) {
+        const rb = rollbackByLogId(res.logId)
+        if (rb.ok) {
+          console.log('[smoke-restore] ROLLBACK ok')
+        } else {
+          console.error('[smoke-restore] 回滚失败: ' + rb.error)
+          app.exit(1)
+          return
+        }
+      }
+      if (process.argv.includes('--dump')) {
+        dump()
+        dumpLogs()
+      }
+    } catch (err) {
+      console.error('[smoke-restore] ERROR', err)
       app.exit(1)
       return
     }

@@ -8,6 +8,7 @@ import { resolveFfmpegPaths } from './ffmpeg'
 import { generateThumbnail } from './thumbnailer'
 import { probeMedia } from './mediaInfo'
 import { VIDEO_EXTENSIONS } from './scanner'
+import { TaskCancelledError, type TaskControl } from './taskControl'
 
 export type ConvertFormat = 'mp4' | 'mkv' | 'webm'
 
@@ -53,7 +54,8 @@ export interface ConvertFileInfo {
  */
 export async function convertFile(
   options: ConvertOptions,
-  onProgress?: (pct: number) => void
+  onProgress?: (pct: number) => void,
+  control?: TaskControl
 ): Promise<ConvertResult> {
   const filePath = options.filePath
   if (!existsSync(filePath)) throw new Error(`源文件不存在：${filePath}`)
@@ -87,7 +89,19 @@ export async function convertFile(
 
   // 源时长（进度计算用）
   const sourceInfo = await probeMedia(resolveFfmpegPaths(app.getAppPath()).ffprobe, filePath)
-  await runFfmpeg(ffmpeg, args, sourceInfo.duration, onProgress)
+  try {
+    await runFfmpeg(ffmpeg, args, sourceInfo.duration, onProgress, control)
+  } catch (err) {
+    if (err instanceof TaskCancelledError) {
+      // 取消时清理半成品输出，避免残留损坏文件
+      try {
+        rmSync(outPath, { force: true })
+      } catch {
+        /* ignore */
+      }
+    }
+    throw err
+  }
 
   // —— 完成：写入视频库 ——
   const fileStat = await stat(outPath)
@@ -214,17 +228,33 @@ export function collectVideoFilesInFolder(folder: string): Promise<string[]> {
   })
 }
 
-/** 运行 ffmpeg 并解析 -progress 输出，进度 0~1 */
+/** 运行 ffmpeg 并解析 -progress 输出，进度 0~1；支持取消令牌（轮询杀进程） */
 function runFfmpeg(
   ffmpegPath: string,
   args: string[],
   durationSec: number | null,
-  onProgress?: (pct: number) => void
+  onProgress?: (pct: number) => void,
+  control?: TaskControl
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdoutBuf = ''
     let stderrBuf = ''
+    let killedByCancel = false
+    let settled = false
+    const poll =
+      control === undefined
+        ? undefined
+        : setInterval(() => {
+            if (control.cancelled && !killedByCancel) {
+              killedByCancel = true
+              child.kill()
+            }
+          }, 300)
+
+    const cleanup = (): void => {
+      if (poll !== undefined) clearInterval(poll)
+    }
 
     child.stdout.on('data', (chunk: Buffer) => {
       stdoutBuf += chunk.toString()
@@ -243,9 +273,18 @@ function runFfmpeg(
       stderrBuf += chunk.toString()
       if (stderrBuf.length > 8192) stderrBuf = stderrBuf.slice(-8192)
     })
-    child.on('error', reject)
+    child.on('error', (err) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(err)
+    })
     child.on('close', (code) => {
-      if (code === 0) resolve()
+      if (settled) return
+      settled = true
+      cleanup()
+      if (killedByCancel) reject(new TaskCancelledError())
+      else if (code === 0) resolve()
       else reject(new Error(stderrBuf.trim().split('\n').pop() ?? `ffmpeg 退出码 ${code}`))
     })
   })

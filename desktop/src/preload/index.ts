@@ -2,6 +2,9 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppInfo,
   Author,
+  BatchRemoveResult,
+  BatchVideoPatch,
+  BatchVideoResult,
   Category,
   ConvertFileInfo,
   ConvertItem,
@@ -14,10 +17,17 @@ import type {
   RenamePreviewItem,
   RenameResult,
   RenameRules,
+  RestoreDiffItem,
+  RestoreDiffKind,
+  RestoreExecuteResult,
+  RestoreLog,
+  RestoreMode,
+  RestorePlanResult,
   ServerStatus,
   StatsSummary,
   Tag,
   Task,
+  TaskActionResult,
   VideoListQuery,
   VideoListResult,
   VideoListItem,
@@ -39,6 +49,12 @@ const api = {
   scanImportFolder: (id: number): Promise<number> => ipcRenderer.invoke('folders:scan', id),
   listTasks: (): Promise<Task[]> => ipcRenderer.invoke('tasks:list'),
   clearTasks: (): Promise<{ ok: boolean; count: number }> => ipcRenderer.invoke('tasks:clear'),
+  /** 单任务控制：取消 / 暂停 / 继续 / 重试 / 删除 */
+  cancelTask: (id: number): Promise<TaskActionResult> => ipcRenderer.invoke('tasks:cancel', id),
+  pauseTask: (id: number): Promise<TaskActionResult> => ipcRenderer.invoke('tasks:pause', id),
+  resumeTask: (id: number): Promise<TaskActionResult> => ipcRenderer.invoke('tasks:resume', id),
+  retryTask: (id: number): Promise<TaskActionResult> => ipcRenderer.invoke('tasks:retry', id),
+  deleteTask: (id: number): Promise<TaskActionResult> => ipcRenderer.invoke('tasks:delete', id),
   onTasksChanged: (cb: (tasks: Task[]) => void): (() => void) => {
     const listener = (_event: Electron.IpcRendererEvent, tasks: Task[]): void => cb(tasks)
     ipcRenderer.on('tasks:changed', listener)
@@ -85,6 +101,16 @@ const api = {
   clearAllVideos: (): Promise<{ ok: boolean; count: number }> =>
     ipcRenderer.invoke('videos:clear-all'),
 
+  // ---- 批量操作（元数据页多选） ----
+  batchUpdateVideos: (ids: number[], patch: BatchVideoPatch): Promise<BatchVideoResult> =>
+    ipcRenderer.invoke('videos:batch-fields', ids, patch),
+  /** 追加标签（与已有标签合并去重） */
+  batchAppendVideoTags: (ids: number[], tagNames: string[]): Promise<BatchVideoResult> =>
+    ipcRenderer.invoke('videos:batch-tags', ids, tagNames),
+  /** 批量删除（deleteFile=true 时同时删除真实本地文件；封面/关键帧走 GC） */
+  batchRemoveVideos: (ids: number[], deleteFile: boolean): Promise<BatchRemoveResult> =>
+    ipcRenderer.invoke('videos:batch-remove', ids, deleteFile),
+
   // ---- 批量重命名 ----
   renamePreview: (
     videos: Array<{ id?: number; filePath: string; title: string }>,
@@ -106,6 +132,8 @@ const api = {
 
   // ---- PotPlayer ----
   detectPotPlayer: (): Promise<PlayerDetectResult> => ipcRenderer.invoke('player:detect'),
+  /** 手动选择播放器 exe（返回 null 表示取消） */
+  selectPlayerFile: (): Promise<string | null> => ipcRenderer.invoke('dialog:select-player'),
   playWithPotPlayer: (videoPath: string): Promise<PlayerPlayResult> =>
     ipcRenderer.invoke('player:play', videoPath),
   savePotPlayerPath: (path: string): Promise<void> => ipcRenderer.invoke('player:save-path', path),
@@ -149,9 +177,20 @@ const api = {
   // ---- 备份 / 恢复 ----
   backupMetaNow: (): Promise<{ ok: boolean; path?: string; count?: number; error?: string }> =>
     ipcRenderer.invoke('settings:meta-backup-now'),
-  /** 恢复备份：不传 confirm=选文件+解析统计 total；confirm=true=删除全部数据后恢复 */
-  restoreMetaBackup: (confirm?: boolean): Promise<{ ok: boolean; count?: number; total?: number; error?: string }> =>
-    ipcRenderer.invoke('settings:meta-restore', confirm ?? null),
+  /** 恢复向导第 1 步：选择备份 → 完整性校验 + 差异分析（只读，不写盘） */
+  planRestoreBackup: (): Promise<RestorePlanResult> => ipcRenderer.invoke('settings:meta-restore-plan'),
+  /** 差异明细（kind 过滤，省略返回全部） */
+  getRestoreDiff: (kind?: RestoreDiffKind | null): Promise<RestoreDiffItem[]> =>
+    ipcRenderer.invoke('settings:meta-restore-diff', kind ?? null),
+  /** 执行恢复（full / backup-first / local-first / missing-only），自动快照后可回滚 */
+  executeRestoreBackup: (mode: RestoreMode): Promise<RestoreExecuteResult> =>
+    ipcRenderer.invoke('settings:meta-restore-execute', mode),
+  /** 最近恢复/回滚日志 */
+  listRestoreLogs: (limit?: number): Promise<RestoreLog[]> =>
+    ipcRenderer.invoke('settings:meta-restore-logs', limit),
+  /** 回滚到某次恢复前的自动快照（参数为恢复日志 id） */
+  rollbackRestoreSnapshot: (logId: number): Promise<{ ok: boolean; error?: string; gcRemoved?: number }> =>
+    ipcRenderer.invoke('settings:meta-restore-rollback', logId),
 
   // ---- 外部链接 ----
   openExternal: (url: string): Promise<{ ok: boolean; error?: string }> =>

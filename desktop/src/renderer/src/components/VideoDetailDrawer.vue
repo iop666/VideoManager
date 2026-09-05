@@ -38,6 +38,15 @@ const displayPath = computed<string>(() => {
   return p
 })
 
+/** 是否可播放：仅当存在真实本地文件（非缺失、非 restored:// 占位） */
+const canPlay = computed<boolean>(() => {
+  const v = video.value
+  if (!v) return false
+  const p = v.filePath ?? ''
+  if (!p || p.startsWith('restored://') || v.status === 'missing') return false
+  return true
+})
+
 /** 历史文件名记录（只读展示） */
 const moreFileNames = computed<string[]>(() => video.value?.moreFileNames ?? [])
 
@@ -60,6 +69,10 @@ async function load(id: number): Promise<void> {
 
 async function play(): Promise<void> {
   if (!video.value) return
+  if (!canPlay.value) {
+    message.warning('文件缺失或尚无本地文件，无法播放')
+    return
+  }
   playing.value = true
   try {
     // 播放计数 +1（本次播放）
@@ -99,9 +112,10 @@ const tagMetas = computed(() => {
         <template v-if="video">
           <div class="detail-thumb" @click="play">
             <ThumbImg :video-id="video.id" :thumbnail-path="video.thumbnailPath" />
-            <div class="play-overlay" :class="{ spinning: playing }">
+            <div v-if="canPlay" class="play-overlay" :class="{ spinning: playing }">
               <n-icon :size="40"><PlayOutline /></n-icon>
             </div>
+            <div v-else class="no-play-hint">无本地文件</div>
           </div>
 
           <div class="file-name-block" style="margin-top: 14px">
@@ -229,6 +243,21 @@ const tagMetas = computed(() => {
 .detail-thumb:hover .play-overlay,
 .play-overlay.spinning {
   opacity: 1;
+}
+
+.no-play-hint {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(0, 0, 0, 0.65);
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 8px;
+  pointer-events: none;
+  white-space: nowrap;
 }
 
 .play-overlay.spinning {

@@ -1,7 +1,7 @@
 {
     "name":  "videomanager-desktop",
     "productName":  "VideoManager",
-    "version":  "0.5.1",
+    "version":  "0.6.0",
     "description":  "VideoManager Windows 端 — 本地视频管理服务器",
     "main":  "./out/main/index.js",
     "private":  true,
